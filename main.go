@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/crowdmob/goamz/aws"
-	"github.com/crowdmob/goamz/sqs"
 	"github.com/GeoNet/impact"
 	"github.com/GeoNet/mseed"
 	"github.com/GeoNet/slink"
+	"github.com/crowdmob/goamz/aws"
+	"github.com/crowdmob/goamz/sqs"
 	"log"
 	"os"
 	"os/signal"
@@ -111,21 +111,21 @@ func main() {
 
 	flag.Parse()
 
-	if region == "" {
-		region = os.Getenv("AWS_IMPACT_REGION")
-		if region == "" {
-			log.Fatalf("unable to find region in environment or command line [AWS_IMPACT_REGION]")
-		}
-	}
-
-	if queue == "" {
-		queue = os.Getenv("AWS_IMPACT_QUEUE")
-		if queue == "" {
-			log.Fatalf("unable to find queue in environment or command line [AWS_IMPACT_QUEUE]")
-		}
-	}
-
 	if !dryrun {
+		if region == "" {
+			region = os.Getenv("AWS_IMPACT_REGION")
+			if region == "" {
+				log.Fatalf("unable to find region in environment or command line [AWS_IMPACT_REGION]")
+			}
+		}
+
+		if queue == "" {
+			queue = os.Getenv("AWS_IMPACT_QUEUE")
+			if queue == "" {
+				log.Fatalf("unable to find queue in environment or command line [AWS_IMPACT_QUEUE]")
+			}
+		}
+
 		// configure amazon ...
 		R := aws.GetRegion(region)
 		// fall through to env then credentials file
