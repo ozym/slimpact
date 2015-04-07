@@ -11,9 +11,52 @@ import (
 	"github.com/GeoNet/slink"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
+
+type Config map[string]*impact.Stream
+
+var state Config
+var stateLock = new(sync.RWMutex)
+
+// load a fresh configuration
+func loadConfig(config string, probation time.Duration, level int, fail bool) {
+	// load json file
+	temp := impact.LoadStreams(config)
+
+	// if it's the first time then fail - otherwise carry on with old config
+	if temp == nil {
+		log.Println("unable to parse config file: ", config)
+		if fail {
+			os.Exit(1)
+		}
+	} else {
+		// initial stream setup
+		for s := range temp {
+			_, err := temp[s].Init(s, probation, (int32)(level))
+			if err != nil {
+				log.Fatalf("unable to get initial state: %s\n", err)
+			}
+		}
+		// swap out current config
+		stateLock.Lock()
+		defer stateLock.Unlock()
+
+		state = temp
+	}
+}
+
+// present the current configuration
+func getConfig() Config {
+	stateLock.RLock()
+	defer stateLock.RUnlock()
+
+	return state
+}
 
 func main() {
 	var Q *sqs.Queue
@@ -98,16 +141,18 @@ func main() {
 		}
 	}
 
-	// load stream configuration
-	state := impact.LoadStreams(config)
+	loadConfig(config, probation, level, true)
 
-	// initial stream setup
-	for s := range state {
-		_, err := state[s].Init(s, probation, (int32)(level))
-		if err != nil {
-			log.Fatalf("unable to get initial state: %s\n", err)
+	// reload configuration ...
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGHUP)
+	go func() {
+		for {
+			<-c
+			log.Printf("reloading config: %s\n", config)
+			loadConfig(config, probation, level, false)
 		}
-	}
+	}()
 
 	// who to call ...
 	server := "localhost:18000"
@@ -184,7 +229,7 @@ func main() {
 
 		// get lookup key
 		srcname := msr.SrcName(0)
-		stream, ok := state[srcname]
+		stream, ok := getConfig()[srcname]
 		if ok == false {
 			continue
 		}
