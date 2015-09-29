@@ -3,16 +3,18 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
-	"github.com/GeoNet/impact"
+	//	"fmt"
 	"github.com/GeoNet/mseed"
 	"github.com/GeoNet/slink"
+	//	"math"
 	"github.com/crowdmob/goamz/aws"
 	"github.com/crowdmob/goamz/sqs"
 	"log"
 	"os"
-	"strings"
+	//"strings"
 	"time"
+
+	"github.com/ozym/impact"
 )
 
 func main() {
@@ -27,6 +29,11 @@ func main() {
 	// streaming channel information
 	var config string
 	flag.StringVar(&config, "config", "impact.json", "provide a streams config file")
+
+	var fdsn string
+	flag.StringVar(&fdsn, "fdsn", "service.geonet.org.nz", "provide fdsn station config server")
+	var reload time.Duration
+	flag.DurationVar(&reload, "reload", time.Minute, "how long to wait between fdsn station queries")
 
 	// amazon queue details
 	var region string
@@ -98,21 +105,6 @@ func main() {
 		}
 	}
 
-	// load json file
-	state := impact.LoadStreams(config)
-	if state == nil {
-		log.Println("unable to parse config file: ", config)
-		os.Exit(1)
-	}
-        
-	// initial stream setup
-	for s := range state {
-		_, err := state[s].Init(s, probation, (int32)(level))
-		if err != nil {
-			log.Fatalf("unable to get initial state: %s\n", err)
-		}
-	}
-
 	// who to call ...
 	server := "localhost:18000"
 	if flag.NArg() > 0 {
@@ -139,8 +131,11 @@ func main() {
 	msr := mseed.NewMSRecord()
 	defer mseed.FreeMSRecord(msr)
 
-	// fixup stream code for messaging
-	replace := strings.NewReplacer("_", ".")
+	state := NewStreams()
+	if err := state.Load(fdsn, int32(level), probation, time.Now()); err != nil {
+		log.Fatal(err)
+	}
+	next := time.Now().Add(reload)
 
 	// output channel
 	result := make(chan impact.Message)
@@ -152,7 +147,7 @@ func main() {
 				continue
 			}
 			if verbose {
-				fmt.Println(string(mm))
+				log.Println(string(mm))
 			}
 			if !dryrun {
 				for n := 0; n < resends; n++ {
@@ -183,33 +178,46 @@ func main() {
 		buf := p.GetMSRecord()
 		msr.Unpack(buf, 512, 1, 0)
 
-		// what to send
-		source := strings.TrimRight(msr.Network()+"."+msr.Station(), "\u0000")
+		// check the rate is greater than zero ...
+		rate := msr.Samprate()
+		if !(rate > 0.0) {
+			continue
+		}
 
-		// get lookup key
+		// time to check for new configurations ....
+		if time.Now().After(next) {
+			if err := state.Load(fdsn, int32(level), probation, time.Now()); err != nil {
+				log.Fatal(err)
+			}
+			next = time.Now().Add(reload)
+		}
+
+		// find the configured stream?
 		srcname := msr.SrcName(0)
-		stream, ok := state[srcname]
-		if ok == false {
+		stream := state.Find(srcname)
+		if stream == nil {
 			continue
 		}
 
 		// recover amplitude samples
 		samples, err := msr.DataSamples()
 		if err != nil {
-			log.Printf("data sample problem! %s\n", err)
+			log.Printf("%s: data sample problem! %s", srcname, err)
 			continue
 		}
 
-		// process each block into a message
-		message, err := stream.ProcessSamples(replace.Replace(source), srcname, msr.Starttime(), samples)
-		if err != nil {
-			log.Printf("data processing problem! %s\n", err)
-			continue
+		// check whether the filters need resetting
+		if stream.Gap(msr.Starttime(), float64(rate)) {
+			stream.Reset(samples)
 		}
+		stream.Last = msr.Endtime()
 
-		// should we send a message
-		if stream.Flush(flush, message.MMI) {
-			result <- message
+		// recover intensity information
+		at, mmi := stream.Intensity(msr.Starttime(), samples)
+
+		// should the message be sent
+		if stream.Flush(flush, mmi) {
+			result <- stream.Message(at, mmi)
 		}
 	}
 }
