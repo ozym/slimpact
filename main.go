@@ -10,11 +10,19 @@ import (
 	"github.com/crowdmob/goamz/aws"
 	"github.com/crowdmob/goamz/sqs"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	//"strings"
 	"time"
 
 	"github.com/ozym/impact"
+
+	"expvar"
+)
+
+var (
+	awsMessages = expvar.NewInt("aws_messages_rate")
 )
 
 func main() {
@@ -105,6 +113,15 @@ func main() {
 		}
 	}
 
+	// for internal instrumentation
+	sock, err := net.Listen("tcp", "localhost:8123")
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		http.Serve(sock, nil)
+	}()
+
 	// who to call ...
 	server := "localhost:18000"
 	if flag.NArg() > 0 {
@@ -131,8 +148,8 @@ func main() {
 	msr := mseed.NewMSRecord()
 	defer mseed.FreeMSRecord(msr)
 
-	state := NewStreams()
-	if err := state.Load(fdsn, int32(level), probation, time.Now()); err != nil {
+	state := NewStreams(int32(level), probation)
+	if err := state.Load(fdsn, time.Now()); err != nil {
 		log.Fatal(err)
 	}
 	next := time.Now().Add(reload)
@@ -160,6 +177,11 @@ func main() {
 					break
 				}
 			}
+			awsMessages.Add(1)
+			go func() {
+				time.Sleep(flush)
+				awsMessages.Add(-1)
+			}()
 		}
 	}()
 
@@ -174,50 +196,25 @@ func main() {
 			continue
 		}
 
-		// decode miniseed block
-		buf := p.GetMSRecord()
-		msr.Unpack(buf, 512, 1, 0)
-
-		// check the rate is greater than zero ...
-		rate := msr.Samprate()
-		if !(rate > 0.0) {
-			continue
-		}
-
 		// time to check for new configurations ....
 		if time.Now().After(next) {
-			if err := state.Load(fdsn, int32(level), probation, time.Now()); err != nil {
+			if err := state.Load(fdsn, time.Now()); err != nil {
 				log.Fatal(err)
 			}
 			next = time.Now().Add(reload)
 		}
 
-		// find the configured stream?
-		srcname := msr.SrcName(0)
-		stream := state.Find(srcname)
-		if stream == nil {
-			continue
-		}
+		// decode miniseed block
+		buf := p.GetMSRecord()
+		msr.Unpack(buf, 512, 1, 0)
 
-		// recover amplitude samples
-		samples, err := msr.DataSamples()
+		msg, err := state.Process(msr, flush)
 		if err != nil {
-			log.Printf("%s: data sample problem! %s", srcname, err)
+			log.Println(err)
 			continue
 		}
-
-		// check whether the filters need resetting
-		if stream.Gap(msr.Starttime(), float64(rate)) {
-			stream.Reset(samples)
-		}
-		stream.Last = msr.Endtime()
-
-		// recover intensity information
-		at, mmi := stream.Intensity(msr.Starttime(), samples)
-
-		// should the message be sent
-		if stream.Flush(flush, mmi) {
-			result <- stream.Message(at, mmi)
+		if msg != nil {
+			result <- *msg
 		}
 	}
 }
