@@ -88,13 +88,13 @@ func main() {
 		// fall through to env then credentials file
 		A, err := aws.GetAuth(key, secret, "", time.Now().Add(30*time.Minute))
 		if err != nil {
-			log.Fatalf("unable to get amazon auth: %s\n", err)
+			log.Fatalf("unable to get amazon auth: %v", err)
 		}
 
 		S := sqs.New(A, R)
 		Q, err = S.GetQueue(queue)
 		if err != nil {
-			log.Fatalf("unable to get amazon queue: %s [%s/%s]\n", err, queue, region)
+			log.Fatalf("unable to get amazon queue: %v [%s/%s]", err, queue, region)
 		}
 	}
 
@@ -104,12 +104,12 @@ func main() {
 		log.Println("unable to parse config file: ", config)
 		os.Exit(1)
 	}
-        
+
 	// initial stream setup
 	for s := range state {
 		_, err := state[s].Init(s, probation, (int32)(level))
 		if err != nil {
-			log.Fatalf("unable to get initial state: %s\n", err)
+			log.Fatalf("unable to get initial state: %v", err)
 		}
 	}
 
@@ -148,7 +148,7 @@ func main() {
 		for m := range result {
 			mm, err := json.Marshal(m)
 			if err != nil {
-				log.Printf("unable to marshal message: %s\n", err)
+				log.Printf("unable to marshal message: %v", err)
 				continue
 			}
 			if verbose {
@@ -158,9 +158,9 @@ func main() {
 				for n := 0; n < resends; n++ {
 					_, err := Q.SendMessage(string(mm))
 					if err != nil {
-						log.Printf("unable to send message [#%d/%d]: %s\n", n+1, resends, err)
-						log.Printf("sleeping %s\n", wait)
+						log.Printf("unable to send message [#%d/%d]: %v, waiting %s", n+1, resends, err, wait)
 						time.Sleep(wait)
+						continue
 					}
 					break
 				}
@@ -168,6 +168,7 @@ func main() {
 		}
 	}()
 
+loop:
 	for {
 		// recover packet ...
 		p, rc := slconn.Collect()
@@ -179,37 +180,54 @@ func main() {
 			continue
 		}
 
-		// decode miniseed block
-		buf := p.GetMSRecord()
-		msr.Unpack(buf, 512, 1, 0)
+		// recover packet ...
+		switch p, rc := slconn.CollectNB(); rc {
+		case slink.SLTERMINATE:
+			log.Printf("terminating")
+			break loop
+		case slink.SLNOPACKET:
+			time.Sleep(100 * time.Millisecond)
+			continue loop
+		case slink.SLPACKET:
+			// check just in case we're shutting down
+			if p != nil && p.PacketType() == slink.SLDATA {
+				// decode miniseed block
+				buf := p.GetMSRecord()
+				msr.Unpack(buf, 512, 1, 0)
 
-		// what to send
-		source := strings.TrimRight(msr.Network()+"."+msr.Station(), "\u0000")
+				// what to send
+				source := strings.TrimRight(msr.Network()+"."+msr.Station(), "\u0000")
 
-		// get lookup key
-		srcname := msr.SrcName(0)
-		stream, ok := state[srcname]
-		if ok == false {
-			continue
+				// get lookup key
+				srcname := msr.SrcName(0)
+				stream, ok := state[srcname]
+				if ok == false {
+					continue
+				}
+
+				// recover amplitude samples
+				samples, err := msr.DataSamples()
+				if err != nil {
+					log.Printf("data sample problem! %v", err)
+					continue
+				}
+
+				// process each block into a message
+				message, err := stream.ProcessSamples(replace.Replace(source), srcname, msr.Starttime(), samples)
+				if err != nil {
+					log.Printf("data processing problem! %v", err)
+					continue
+				}
+
+				// should we send a message
+				if stream.Flush(flush, message.MMI) {
+					result <- message
+				}
+			}
+		default:
+			log.Println("invalid packet")
+			break loop
 		}
 
-		// recover amplitude samples
-		samples, err := msr.DataSamples()
-		if err != nil {
-			log.Printf("data sample problem! %s\n", err)
-			continue
-		}
-
-		// process each block into a message
-		message, err := stream.ProcessSamples(replace.Replace(source), srcname, msr.Starttime(), samples)
-		if err != nil {
-			log.Printf("data processing problem! %s\n", err)
-			continue
-		}
-
-		// should we send a message
-		if stream.Flush(flush, message.MMI) {
-			result <- message
-		}
 	}
 }
